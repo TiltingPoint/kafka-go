@@ -7,6 +7,7 @@ import (
 	"io"
 	"math/rand"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -131,6 +132,41 @@ type WriterConfig struct {
 	ErrorLogger Logger
 
 	newPartitionWriter func(partition int, config WriterConfig, stats *writerStats) partitionWriter
+}
+
+type WriterError struct {
+	Msg Message
+	Err error
+}
+
+func (e *WriterError) Error() string {
+	return e.Err.Error()
+}
+
+func (e *WriterError) Temporary() bool {
+	return isTemporary(e.Err)
+}
+
+func (e *WriterError) Timeout() bool {
+	return isTimeout(e.Err)
+}
+
+type WriterErrors []WriterError
+
+func (wes WriterErrors) Error() string {
+	if len(wes) == 1 {
+		return fmt.Sprintf("1 WriterError occurred:\n\t* %s\n", wes[0].Err)
+	}
+
+	points := make([]string, len(wes))
+	for i, we := range wes {
+		points[i] = fmt.Sprintf("* %s", we.Err)
+	}
+
+	return fmt.Sprintf(
+		"%d WriterErrors occurred:\n\t%s\n",
+		len(wes),
+		strings.Join(points, "\n\t"))
 }
 
 // WriterStats is a data structure returned by a call to Writer.Stats that
@@ -302,90 +338,129 @@ func (w *Writer) WriteMessages(ctx context.Context, msgs ...Message) error {
 		return nil
 	}
 
-	var err error
-	var res chan error
+	errs := make(WriterErrors, 0, len(msgs))
+	tooLarge := 0
+	var res chan writerResponse
 	if !w.config.Async {
-		res = make(chan error, len(msgs))
+		res = make(chan writerResponse, len(msgs))
 	}
 	t0 := time.Now()
 
 	for attempt := 0; attempt < w.config.MaxAttempts; attempt++ {
+		handled := make(map[int]bool, len(msgs))
 		w.mutex.RLock()
 
 		if w.closed {
 			w.mutex.RUnlock()
-			return io.ErrClosedPipe
+			for _, m := range msgs {
+				errs = append(errs, WriterError{
+					Msg: m,
+					Err: io.ErrClosedPipe,
+				})
+			}
+			return errs
 		}
 
 		for i, msg := range msgs {
 			if int(msg.size()) > w.config.BatchBytes {
-				err := MessageTooLargeError{
-					Message:   msg,
-					Remaining: msgs[i+1:],
+				errs = append(errs, WriterError{
+					Msg: msg,
+					Err: MessageTooLargeError{
+						Message: msg,
+					},
+				})
+				tooLarge += 1
+				handled[i] = true
+			} else {
+				select {
+				case w.msgs <- writerMessage{
+					msg: msg,
+					res: res,
+					id:  i,
+				}:
+				case <-ctx.Done():
+					w.mutex.RUnlock()
+					// treat all messages as failed
+					for j, m := range msgs {
+						// don't double count MessageTooLargeErrors which may already be present in errs
+						if _, ok := handled[j]; !ok {
+							errs = append(errs, WriterError{
+								Msg: m,
+								Err: ctx.Err(),
+							})
+						}
+					}
+					return errs
 				}
-				w.mutex.RUnlock()
-				return err
-			}
-			select {
-			case w.msgs <- writerMessage{
-				msg: msg,
-				res: res,
-			}:
-			case <-ctx.Done():
-				w.mutex.RUnlock()
-				return ctx.Err()
 			}
 		}
-
 		w.mutex.RUnlock()
 
 		if w.config.Async {
 			break
 		}
 
-		var retry []Message
-
-		for i := 0; i != len(msgs); i++ {
+		sent := len(msgs) - len(handled)
+		for i := 0; i != sent; i++ {
 			select {
-			case e := <-res:
-				if e != nil {
-					if we, ok := e.(*writerError); ok {
-						w.stats.retries.observe(1)
-						retry, err = append(retry, we.msg), we.err
-					} else {
-						err = e
-					}
+			case r := <-res:
+				handled[r.id] = true
+				if r.err != nil {
+					w.stats.retries.observe(1)
+					errs = append(errs, *r.err)
 				}
 			case <-ctx.Done():
-				return ctx.Err()
+				// all unacked msgs become errors
+				for x := range msgs {
+					if _, ok := handled[x]; !ok {
+						errs = append(errs, WriterError{
+							Msg: msgs[x],
+							Err: ctx.Err(),
+						})
+					}
+				}
+				return errs
 			}
 		}
 
-		if msgs = retry; len(msgs) == 0 {
+		retryable := len(errs) - tooLarge
+		if retryable == 0 {
 			break
 		}
 
 		timer := time.NewTimer(backoff(attempt+1, 100*time.Millisecond, 1*time.Second))
+		var override error
 		select {
 		case <-timer.C:
-			// Only clear the error (so we retry the loop) if we have more retries, otherwise
-			// we risk silencing the error.
+			// Only clear the failures (so we retry the loop) if we have more retries
 			if attempt < w.config.MaxAttempts-1 {
-				err = nil
+				// populate msgs for a retry
+				msgs = msgs[:0]
+				for i := tooLarge; i < len(errs); i++ {
+					msgs = append(msgs, errs[i].Msg)
+				}
+				errs = errs[:tooLarge]
 			}
 		case <-ctx.Done():
-			err = ctx.Err()
+			override = ctx.Err()
 		case <-w.done:
-			err = io.ErrClosedPipe
+			override = io.ErrClosedPipe
 		}
 		timer.Stop()
 
-		if err != nil {
+		if override != nil {
+			for i := tooLarge; i < len(errs); i++ {
+				errs[i].Err = override
+			}
 			break
 		}
 	}
 	w.stats.writeTime.observeDuration(time.Since(t0))
-	return err
+
+	if len(errs) > 0 {
+		return errs
+	}
+	return nil
 }
 
 // Stats returns a snapshot of the writer stats since the last time the method
@@ -492,7 +567,13 @@ func (w *Writer) run() {
 					err = fmt.Errorf("failed to find any partitions for topic %s", w.config.Topic)
 				}
 				if wm.res != nil {
-					wm.res <- &writerError{msg: wm.msg, err: err}
+					wm.res <- writerResponse{
+						id: wm.id,
+						err: &WriterError{
+							Msg: wm.msg,
+							Err: err,
+						},
+					}
 				}
 			}
 
@@ -630,7 +711,8 @@ func (w *writer) run() {
 	var conn *Conn
 	var done bool
 	var batch = make([]Message, 0, w.batchSize)
-	var resch = make([](chan<- error), 0, w.batchSize)
+	var resch = make([](chan<- writerResponse), 0, w.batchSize)
+	var ids = make([]int, 0, w.batchSize)
 	var lastMsg writerMessage
 	var batchSizeBytes int
 	var idleConnDeadline time.Time
@@ -647,9 +729,8 @@ func (w *writer) run() {
 		// If a lstMsg exists we need to add it to the batch so we don't lose it.
 		if len(lastMsg.msg.Value) != 0 {
 			batch = append(batch, lastMsg.msg)
-			if lastMsg.res != nil {
-				resch = append(resch, lastMsg.res)
-			}
+			resch = append(resch, lastMsg.res)
+			ids = append(ids, lastMsg.id)
 			batchSizeBytes += int(lastMsg.msg.size())
 			lastMsg = writerMessage{}
 			if !batchTimerRunning {
@@ -670,9 +751,8 @@ func (w *writer) run() {
 					break
 				}
 				batch = append(batch, wm.msg)
-				if wm.res != nil {
-					resch = append(resch, wm.res)
-				}
+				resch = append(resch, wm.res)
+				ids = append(ids, wm.id)
 				batchSizeBytes += int(wm.msg.size())
 				mustFlush = len(batch) >= w.batchSize || batchSizeBytes >= w.maxMessageBytes
 			}
@@ -702,7 +782,7 @@ func (w *writer) run() {
 				continue
 			}
 			var err error
-			if conn, err = w.write(conn, batch, resch); err != nil {
+			if conn, err = w.write(conn, batch, resch, ids); err != nil {
 				if conn != nil {
 					conn.Close()
 					conn = nil
@@ -716,8 +796,13 @@ func (w *writer) run() {
 			for i := range resch {
 				resch[i] = nil
 			}
+
+			for i := range ids {
+				ids[i] = 0
+			}
 			batch = batch[:0]
 			resch = resch[:0]
+			ids = ids[:0]
 			batchSizeBytes = 0
 		}
 	}
@@ -737,7 +822,7 @@ func (w *writer) dial() (conn *Conn, err error) {
 	return
 }
 
-func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret *Conn, err error) {
+func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- writerResponse), ids []int) (ret *Conn, err error) {
 	w.stats.writes.observe(1)
 	if conn == nil {
 		if conn, err = w.dial(); err != nil {
@@ -746,7 +831,15 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 				logger.Printf("error dialing kafka brokers for topic %s (partition %d): %s", w.topic, w.partition, err)
 			})
 			for i, res := range resch {
-				res <- &writerError{msg: batch[i], err: err}
+				if res != nil {
+					res <- writerResponse{
+						id: ids[i],
+						err: &WriterError{
+							Msg: batch[i],
+							Err: err,
+						},
+					}
+				}
 			}
 			return
 		}
@@ -760,15 +853,28 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 			logger.Printf("error writing messages to %s (partition %d): %s", w.topic, w.partition, err)
 		})
 		for i, res := range resch {
-			res <- &writerError{msg: batch[i], err: err}
+			if res != nil {
+				res <- writerResponse{
+					id: ids[i],
+					err: &WriterError{
+						Msg: batch[i],
+						Err: err,
+					},
+				}
+			}
 		}
 	} else {
 		for _, m := range batch {
 			w.stats.messages.observe(1)
 			w.stats.bytes.observe(int64(len(m.Key) + len(m.Value)))
 		}
-		for _, res := range resch {
-			res <- nil
+		for i, res := range resch {
+			if res != nil {
+				res <- writerResponse{
+					id:  i,
+					err: nil,
+				}
+			}
 		}
 	}
 	t1 := time.Now()
@@ -781,28 +887,13 @@ func (w *writer) write(conn *Conn, batch []Message, resch [](chan<- error)) (ret
 
 type writerMessage struct {
 	msg Message
-	res chan<- error
+	res chan<- writerResponse
+	id  int
 }
 
-type writerError struct {
-	msg Message
-	err error
-}
-
-func (e *writerError) Cause() error {
-	return e.err
-}
-
-func (e *writerError) Error() string {
-	return e.err.Error()
-}
-
-func (e *writerError) Temporary() bool {
-	return isTemporary(e.err)
-}
-
-func (e *writerError) Timeout() bool {
-	return isTimeout(e.err)
+type writerResponse struct {
+	id  int
+	err *WriterError
 }
 
 func shuffledStrings(list []string) []string {

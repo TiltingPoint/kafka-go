@@ -5,7 +5,7 @@ import (
 	"errors"
 	"io"
 	"math"
-	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -21,12 +21,22 @@ func TestWriter(t *testing.T) {
 			scenario: "closing a writer right after creating it returns promptly with no error",
 			function: testWriterClose,
 		},
-
+		{
+			scenario: "writing messages on closed writer should return error",
+			function: testClosedWriterErr,
+		},
+		{
+			scenario: "writing empty Message slice returns promptly with no error",
+			function: testEmptyWrite,
+		},
+		{
+			scenario: "writing messages after context is done should return an error",
+			function: testContextDoneErr,
+		},
 		{
 			scenario: "writing 1 message through a writer using round-robin balancing produces 1 message to the first partition",
 			function: testWriterRoundRobin1,
 		},
-
 		{
 			scenario: "running out of max attempts should return an error",
 			function: testWriterMaxAttemptsErr,
@@ -47,6 +57,10 @@ func TestWriter(t *testing.T) {
 			scenario: "writing messsages with a small batch byte size",
 			function: testWriterSmallBatchBytes,
 		},
+		{
+			scenario: "writing messages with retries enabled",
+			function: testWriterRetries,
+		},
 	}
 
 	for _, test := range tests {
@@ -56,6 +70,69 @@ func TestWriter(t *testing.T) {
 			testFunc(t)
 		})
 	}
+}
+
+type writerTestCase WriterErrors
+
+func (wt writerTestCase) errorsEqual(wes WriterErrors) bool {
+	exp := make(map[string]int)
+	numExp := 0
+	for _, t := range wt {
+		if t.Err != nil {
+			numExp += 1
+			k := string(t.Msg.Value) + t.Err.Error()
+			if _, ok := exp[k]; ok {
+				exp[k] += 1
+			} else {
+				exp[k] = 1
+			}
+		}
+	}
+
+	if len(wes) != numExp {
+		return false
+	}
+
+	for _, e := range wes {
+		k := string(e.Msg.Value) + e.Err.Error()
+		if _, ok := exp[k]; ok {
+			exp[k] -= 1
+		} else {
+			return false
+		}
+	}
+
+	for _, e := range exp {
+		if e != 0 {
+			return false
+		}
+	}
+
+	return true
+}
+
+func (wt writerTestCase) msgs() []Message {
+	msgs := make([]Message, len(wt))
+	for i, m := range wt {
+		msgs[i] = m.Msg
+	}
+
+	return msgs
+}
+
+func (wt writerTestCase) expected() WriterErrors {
+	exp := make(WriterErrors, 0, len(wt))
+	for _, v := range wt {
+		if v.Err != nil {
+			exp = append(exp, v)
+		}
+	}
+
+	if len(exp) > 0 {
+		return exp
+	}
+
+	return nil
 }
 
 func newTestWriter(config WriterConfig) *Writer {
@@ -75,6 +152,120 @@ func testWriterClose(t *testing.T) {
 
 	if err := w.Close(); err != nil {
 		t.Error(err)
+	}
+}
+
+func testClosedWriterErr(t *testing.T) {
+	tcs := []writerTestCase{
+		{
+			{
+				Msg: Message{Value: []byte("Hello World!")},
+				Err: io.ErrClosedPipe,
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("Hello")},
+				Err: io.ErrClosedPipe,
+			},
+			{
+				Msg: Message{Value: []byte("World!")},
+				Err: io.ErrClosedPipe,
+			},
+		},
+	}
+
+	const topic = "test-writer-0"
+	w := newTestWriter(WriterConfig{
+		Topic: topic,
+	})
+
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	for i, tc := range tcs {
+		err := w.WriteMessages(context.Background(), tc.msgs()...)
+		if err == nil {
+			t.Errorf("test %d: expected error", i)
+			continue
+		}
+
+		wes, ok := err.(WriterErrors)
+		if !ok {
+			t.Errorf("test %d: expected WriterErrors", i)
+			continue
+		}
+
+		if !tc.errorsEqual(wes) {
+			t.Errorf("test %d: unexpected errors occurred.\nExpected:\n%sFound:\n%s", i, tc.expected(), wes)
+		}
+	}
+}
+
+func testEmptyWrite(t *testing.T) {
+	const topic = "test-writer-0"
+	w := newTestWriter(WriterConfig{
+		Topic: topic,
+	})
+
+	defer func() {
+		_ = w.Close()
+	}()
+
+	if err := w.WriteMessages(context.Background(), []Message{}...); err != nil {
+		t.Error("unexpected error occurred", err)
+	}
+}
+
+func testContextDoneErr(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	tcs := []writerTestCase{
+		{
+			{
+				Msg: Message{Value: []byte("Hello World!")},
+				Err: ctx.Err(),
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("Hello")},
+				Err: ctx.Err(),
+			},
+			{
+				Msg: Message{Value: []byte("World")},
+				Err: ctx.Err(),
+			},
+		},
+	}
+
+	const topic = "test-writer-0"
+	w := newTestWriter(WriterConfig{
+		Topic: topic,
+	})
+
+	defer func() {
+		_ = w.Close()
+	}()
+
+	for i, tc := range tcs {
+		err := w.WriteMessages(ctx, tc.msgs()...)
+		if err == nil {
+			t.Errorf("test %d: expected error", i)
+			continue
+		}
+
+		wes, ok := err.(WriterErrors)
+		if !ok {
+			t.Errorf("test %d: expected WriterErrors", i)
+			continue
+		}
+
+		if !tc.errorsEqual(wes) {
+			t.Errorf("test %d: unexpected errors occurred.\nExpected:\n%sFound:\n%s", i, tc.expected(), wes)
+		}
 	}
 }
 
@@ -140,16 +331,20 @@ func TestValidateWriter(t *testing.T) {
 	}
 }
 
-type fakeWriter struct{}
+type errorWriter struct{}
 
-func (f *fakeWriter) messages() chan<- writerMessage {
+func (w *errorWriter) messages() chan<- writerMessage {
 	ch := make(chan writerMessage, 1)
 
 	go func() {
 		for {
 			msg := <-ch
-			msg.res <- &writerError{
-				err: errors.New("bad attempt"),
+			msg.res <- writerResponse{
+				id: msg.id,
+				err: &WriterError{
+					Err: errors.New("bad attempt"),
+					Msg: msg.msg,
+				},
 			}
 		}
 	}()
@@ -157,46 +352,99 @@ func (f *fakeWriter) messages() chan<- writerMessage {
 	return ch
 }
 
-func (f *fakeWriter) close() {
+func (w *errorWriter) close() {
 
 }
 
 func testWriterMaxAttemptsErr(t *testing.T) {
+	tcs := []writerTestCase{
+		{
+			{
+				Msg: Message{Value: []byte("test 1 error")},
+				Err: errors.New("bad attempt"),
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("test multi error")},
+				Err: errors.New("bad attempt"),
+			},
+			{
+				Msg: Message{Value: []byte("test multi error")},
+				Err: errors.New("bad attempt"),
+			},
+		},
+	}
+
 	const topic = "test-writer-2"
 
 	createTopic(t, topic, 1)
 	w := newTestWriter(WriterConfig{
 		Topic:       topic,
-		MaxAttempts: 1,
+		MaxAttempts: 2,
 		Balancer:    &RoundRobin{},
-		newPartitionWriter: func(p int, config WriterConfig, stats *writerStats) partitionWriter {
-			return &fakeWriter{}
+		newPartitionWriter: func(_ int, _ WriterConfig, _ *writerStats) partitionWriter {
+			return &errorWriter{}
 		},
 	})
-	defer w.Close()
+	defer func() {
+		_ = w.Close()
+	}()
 
-	if err := w.WriteMessages(context.Background(), Message{
-		Value: []byte("Hello World!"),
-	}); err == nil {
-		t.Error("expected error")
-		return
-	} else if err != nil {
-		if !strings.Contains(err.Error(), "bad attempt") {
-			t.Errorf("unexpected error: %s", err)
-			return
+	for i, tc := range tcs {
+		err := w.WriteMessages(context.Background(), tc.msgs()...)
+		if err == nil {
+			t.Errorf("test %d: expected error", i)
+			continue
+		}
+
+		wes, ok := err.(WriterErrors)
+		if !ok {
+			t.Errorf("test %d: expected WriterErrors", i)
+			continue
+		}
+
+		if !tc.errorsEqual(wes) {
+			t.Errorf("test %d: unexpected errors occurred.\nExpected:\n%sFound:\n%s", i, tc.expected(), wes)
 		}
 	}
 }
 
 func testWriterMaxBytes(t *testing.T) {
-	topic := makeTopic()
+	tcs := []writerTestCase{
+		{
+			{
+				Msg: Message{Value: []byte("Hello World!")},
+				Err: MessageTooLargeError{},
+			},
+			{
+				Msg: Message{Value: []byte("Hi")},
+				Err: nil,
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("Too large!")},
+				Err: MessageTooLargeError{},
+			},
+			{
+				Msg: Message{Value: []byte("Also too long!")},
+				Err: MessageTooLargeError{},
+			},
+		},
+	}
 
+	topic := makeTopic()
+	maxBytes := 25
 	createTopic(t, topic, 1)
 	w := newTestWriter(WriterConfig{
 		Topic:      topic,
-		BatchBytes: 25,
+		BatchBytes: maxBytes,
 	})
-	defer w.Close()
+
+	defer func() {
+		_ = w.Close()
+	}()
 
 	if err := w.WriteMessages(context.Background(), Message{
 		Value: []byte("Hi"),
@@ -205,37 +453,21 @@ func testWriterMaxBytes(t *testing.T) {
 		return
 	}
 
-	firstMsg := []byte("Hello World!")
-	secondMsg := []byte("LeftOver!")
-	msgs := []Message{
-		{
-			Value: firstMsg,
-		},
-		{
-			Value: secondMsg,
-		},
-	}
-	if err := w.WriteMessages(context.Background(), msgs...); err == nil {
-		t.Error("expected error")
-		return
-	} else if err != nil {
-		switch e := err.(type) {
-		case MessageTooLargeError:
-			if string(e.Message.Value) != string(firstMsg) {
-				t.Errorf("unxpected returned message. Expected: %s, Got %s", firstMsg, e.Message.Value)
-				return
-			}
-			if len(e.Remaining) != 1 {
-				t.Error("expected remaining errors; found none")
-				return
-			}
-			if string(e.Remaining[0].Value) != string(secondMsg) {
-				t.Errorf("unxpected returned message. Expected: %s, Got %s", secondMsg, e.Message.Value)
-				return
-			}
-		default:
-			t.Errorf("unexpected error: %s", err)
-			return
+	for i, tc := range tcs {
+		err := w.WriteMessages(context.Background(), tc.msgs()...)
+		if err == nil {
+			t.Errorf("test %d: expected error", i)
+			continue
+		}
+
+		wes, ok := err.(WriterErrors)
+		if !ok {
+			t.Errorf("test %d: expected WriterErrors", i)
+			continue
+		}
+
+		if !tc.errorsEqual(wes) {
+			t.Errorf("test %d: unexpected errors occurred.\nExpected:\n%sFound:\n%s", i, tc.expected(), wes)
 		}
 	}
 }
@@ -429,5 +661,120 @@ func testWriterSmallBatchBytes(t *testing.T) {
 			continue
 		}
 		t.Error("bad messages in partition", msgs)
+	}
+}
+
+type testRetryWriter struct {
+	ch   chan writerMessage
+	join sync.WaitGroup
+}
+
+func (w *testRetryWriter) messages() chan<- writerMessage {
+	return w.ch
+}
+
+func (w *testRetryWriter) close() {
+	close(w.ch)
+	w.join.Wait()
+}
+
+func (w *testRetryWriter) run(errs int) {
+	w.join.Add(1)
+	defer w.join.Done()
+
+	var done bool
+	for !done {
+		msg, ok := <-w.ch
+		if !ok {
+			done = true
+		} else {
+			if errs > 0 {
+				msg.res <- writerResponse{
+					id: msg.id,
+					err: &WriterError{
+						Msg: msg.msg,
+						Err: errors.New("bad attempt"),
+					},
+				}
+				errs -= 1
+			} else {
+				msg.res <- writerResponse{
+					id:  msg.id,
+					err: nil,
+				}
+			}
+		}
+	}
+}
+
+func newTestRetryWriter(_ int, _ WriterConfig, _ *writerStats) partitionWriter {
+	w := &testRetryWriter{ch: make(chan writerMessage, 1)}
+	go w.run(2)
+	return w
+}
+
+func testWriterRetries(t *testing.T) {
+	tcs := []writerTestCase{
+		{
+			{
+				Msg: Message{Value: []byte("test message 1")},
+				Err: nil,
+			},
+			{
+				Msg: Message{Value: []byte("test message 2")},
+				Err: nil,
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("these messages")},
+				Err: nil,
+			},
+			{
+				Msg: Message{Value: []byte("should succeed")},
+				Err: nil,
+			},
+			{
+				Msg: Message{Value: []byte("for this test case")},
+				Err: nil,
+			},
+		},
+		{
+			{
+				Msg: Message{Value: []byte("this message should fail")},
+				Err: errors.New("bad attempt"),
+			},
+		},
+	}
+
+	const topic = "test-writer-retry"
+	createTopic(t, topic, 1)
+
+	for i, tc := range tcs {
+		w := newTestWriter(WriterConfig{
+			Topic:              topic,
+			MaxAttempts:        2,
+			Balancer:           &RoundRobin{},
+			newPartitionWriter: newTestRetryWriter,
+		})
+
+		err := w.WriteMessages(context.Background(), tc.msgs()...)
+		if err == nil {
+			if tc.expected() != nil {
+				t.Errorf("test %d: expected error", i)
+			}
+		} else {
+			if wes, ok := err.(WriterErrors); !ok {
+				t.Errorf("test %d: expected WriterErrors", i)
+			} else {
+				if !tc.errorsEqual(wes) {
+					t.Errorf("test %d: unexpected errors occurred.\nExpected:\n%sFound:\n%s", i, tc.expected(), wes)
+				}
+			}
+		}
+
+		if err = w.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
